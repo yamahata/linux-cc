@@ -19,6 +19,7 @@
 #include <linux/kernel.h>
 
 #define KVM_UTIL_MIN_PFN	2
+#define KVM_VM_TYPE_DEFAULT	0
 
 static int vcpu_mmap_sz(void);
 
@@ -208,13 +209,36 @@ _Static_assert(sizeof(vm_guest_mode_params)/sizeof(struct vm_guest_mode_params) 
  * Return:
  *   Pointer to opaque structure that describes the created VM.
  *
- * Creates a VM with the mode specified by mode (e.g. VM_MODE_P52V48_4K).
+ * Wrapper VM Create function to create a VM with default type (0).
+ */
+struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
+{
+	return __vm_create(mode, phy_pages, perm, KVM_VM_TYPE_DEFAULT);
+}
+
+/*
+ * VM Create with a custom type
+ *
+ * Input Args:
+ *   mode - VM Mode (e.g. VM_MODE_P52V48_4K)
+ *   phy_pages - Physical memory pages
+ *   perm - permission
+ *   type - VM type
+ *
+ * Output Args: None
+ *
+ * Return:
+ *   Pointer to opaque structure that describes the created VM.
+ *
+ * Creates a VM with the mode specified by mode (e.g. VM_MODE_P52V48_4K) and the
+ * type specified in type (e.g. KVM_X86_LEGACY_VM, KVM_X86_TDX_VM ...).
  * When phy_pages is non-zero, a memory region of phy_pages physical pages
  * is created and mapped starting at guest physical address 0.  The file
  * descriptor to control the created VM is created with the permissions
  * given by perm (e.g. O_RDWR).
  */
-struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
+struct kvm_vm *__vm_create(enum vm_guest_mode mode, uint64_t phy_pages,
+			    int perm, int type)
 {
 	struct kvm_vm *vm;
 
@@ -230,7 +254,7 @@ struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
 	hash_init(vm->regions.slot_hash);
 
 	vm->mode = mode;
-	vm->type = 0;
+	vm->type = type;
 
 	vm->pa_bits = vm_guest_mode_params[mode].pa_bits;
 	vm->va_bits = vm_guest_mode_params[mode].va_bits;
@@ -644,9 +668,10 @@ void kvm_vm_free(struct kvm_vm *vmp)
 	if (vmp == NULL)
 		return;
 
-	/* Free userspace_mem_regions. */
-	hash_for_each_safe(vmp->regions.slot_hash, ctr, node, region, slot_node)
-		__vm_mem_region_delete(vmp, region, false);
+  // !! HACK !! do not remove the memory regions
+  /* Free userspace_mem_regions. */
+  // hash_for_each_safe(vmp->regions.slot_hash, ctr, node, region, slot_node)
+  //   __vm_mem_region_delete(vmp, region, false);
 
 	/* Free sparsebit arrays. */
 	sparsebit_free(&vmp->vpages_valid);
@@ -1607,6 +1632,34 @@ void vcpu_set_mp_state(struct kvm_vm *vm, uint32_t vcpuid,
 
 	ret = ioctl(vcpu->fd, KVM_SET_MP_STATE, mp_state);
 	TEST_ASSERT(ret == 0, "KVM_SET_MP_STATE IOCTL failed, "
+		"rc: %i errno: %i", ret, errno);
+}
+
+/*
+ * VM VCPU Get MP State
+ *
+ * Input Args:
+ *   vm - Virtual Machine
+ *   vcpuid - VCPU ID
+ *
+ * Output Args: None
+ *   mp_state - mp_state to be set
+ *
+ * Return: None
+ *
+ * Gets the MP state of the VCPU given by vcpuid, to the state given
+ * by mp_state.
+ */
+void vcpu_get_mp_state(struct kvm_vm *vm, uint32_t vcpuid,
+		       struct kvm_mp_state *mp_state)
+{
+	struct vcpu *vcpu = vcpu_find(vm, vcpuid);
+	int ret;
+
+	TEST_ASSERT(vcpu != NULL, "vcpu not found, vcpuid: %u", vcpuid);
+
+	ret = ioctl(vcpu->fd, KVM_GET_MP_STATE, mp_state);
+	TEST_ASSERT(ret == 0, "KVM_GET_MP_STATE IOCTL failed, "
 		"rc: %i errno: %i", ret, errno);
 }
 

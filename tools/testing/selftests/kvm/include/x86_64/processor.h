@@ -424,6 +424,10 @@ enum x86_page_size {
 };
 void __virt_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr,
 		   enum x86_page_size page_size);
+void vm_vcpu_add_tdx(struct kvm_vm *vm, uint32_t vcpuid);
+
+#define __stringify_1(x) #x
+#define __stringify(x)  __stringify_1(x)
 
 /*
  * Basic CPU control in CR0
