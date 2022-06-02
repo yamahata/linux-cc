@@ -71,9 +71,6 @@ static DEFINE_IDA(tdx_keyid_pool);
 
 static int tdx_keyid_alloc(void)
 {
-	if (!cpu_feature_enabled(X86_FEATURE_TDX))
-		return -EINVAL;
-
 	if (WARN_ON_ONCE(!tdx_keyids_start || !tdx_nr_keyids))
 		return -EINVAL;
 
@@ -464,6 +461,7 @@ static int tdx_do_tdh_mng_key_config(void *param)
 int tdx_vm_init(struct kvm *kvm)
 {
 	struct kvm_tdx *kvm_tdx = to_kvm_tdx(kvm);
+	cpumask_var_t packages;
 	int ret, i;
 	u64 err;
 
@@ -511,6 +509,10 @@ int tdx_vm_init(struct kvm *kvm)
 	}
 	tdx_add_td_page(&kvm_tdx->tdr);
 
+	if (!zalloc_cpumask_var(&packages, GFP_KERNEL)) {
+		ret = -ENOMEM;
+		goto free_tdcs;
+	}
 	/*
 	 * TODO: optimize to invoke the callback only once per CPU package
 	 * instead of all CPUS because TDH.MNG.KEY.CONFIG is per CPU package
@@ -520,13 +522,18 @@ int tdx_vm_init(struct kvm *kvm)
 	 * TDH.MNG.KEY.CONFIG competes for TDR lock.
 	 */
 	for_each_online_cpu(i) {
+		int pkg = topology_physical_package_id(i);
+
+		if (cpumask_test_and_set_cpu(pkg, packages))
+			continue;
 		ret = smp_call_on_cpu(i, tdx_do_tdh_mng_key_config,
 				&kvm_tdx->tdr.pa, 1);
 		if (ret)
 			break;
 	}
+	free_cpumask_var(packages);
 	if (ret)
-		goto teardown;
+  		goto teardown;
 
 	for (i = 0; i < tdx_caps.tdcs_nr_pages; i++) {
 		err = tdh_mng_addcx(kvm_tdx->tdr.pa, kvm_tdx->tdcs[i].pa);
