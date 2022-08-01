@@ -1508,12 +1508,10 @@ void verify_shared_mem(void)
 {
 	struct kvm_vm *vm;
 	struct kvm_run *run;
-	struct userspace_mem_region *region;
 	uint16_t guest_read_val;
 	uint64_t shared_gpa;
 	uint64_t shared_hva;
 	uint64_t shared_pages_num;
-	int ctr;
 
 	printf("Verifying shared memory\n");
 
@@ -1527,11 +1525,9 @@ void verify_shared_mem(void)
 	vm_vcpu_add_tdx(vm, 0);
 
 	/* Allocate shared memory. */
-	shared_gpa = 0x80000000;
-	shared_pages_num = 1;
-	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
-				    shared_gpa, 1,
-				    shared_pages_num, 0);
+	shared_hva = add_shared_mem_region(vm, 0x80000000, 1);
+	TEST_ASSERT(shared_hva != 0,
+		    "Guest address not found in guest memory regions\n");
 
 	/* Setup and initialize VM memory. */
 	prepare_source_image(vm, guest_shared_mem,
@@ -1543,19 +1539,6 @@ void verify_shared_mem(void)
 	printf("\t ... Starting guest execution\n");
 	vcpu_run(vm, 0);
 	CHECK_GUEST_FAILURE(run);
-
-	/* Get the host's shared memory address. */
-	shared_hva = 0;
-	hash_for_each(vm->regions.slot_hash, ctr, region, slot_node) {
-		uint64_t region_guest_addr;
-		region_guest_addr = (uint64_t)region->region.guest_phys_addr;
-		if (region_guest_addr == (shared_gpa)) {
-			shared_hva = (uint64_t)region->host_mem;
-			break;
-		}
-	}
-	TEST_ASSERT(shared_hva != 0,
-		    "Guest address not found in guest memory regions\n");
 
 	/* Verify guest write -> host read succeeds. */
 	printf("\t ... Guest wrote 0x1234 to shared memory\n");

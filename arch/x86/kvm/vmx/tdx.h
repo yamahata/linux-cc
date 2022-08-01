@@ -45,6 +45,8 @@ struct kvm_tdx {
 	 * runs concurrently.
 	 */
 	spinlock_t seamcall_lock;
+
+	atomic_t migration_in_progress;
 };
 
 union tdx_exit_reason {

@@ -130,6 +130,8 @@ void initialize_td_vcpu(struct kvm_vm *vm, uint32_t vcpuid);
 void prepare_source_image(struct kvm_vm *vm, void *guest_code,
 			  size_t guest_code_size,
 			  uint64_t guest_code_signature);
+uint64_t add_shared_mem_region(struct kvm_vm *vm, uint64_t guest_gpa,
+			       uint64_t num_pages);
 
 /*
  * Generic TDCALL function that can be used to communicate with TDX module or

@@ -6,6 +6,9 @@
 #include <linux/kvm_host.h>
 
 hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu, bool private);
+hpa_t kvm_tdp_mmu_get_vcpu_root_hpa_no_alloc(struct kvm_vcpu *vcpu, bool private);
+hpa_t kvm_dtp_mmu_move_private_pages_from(struct kvm_vcpu *vcpu,
+					  struct kvm_vcpu *src_vcpu);
 
 __must_check static inline bool kvm_tdp_mmu_get_root(struct kvm *kvm,
 						     struct kvm_mmu_page *root)

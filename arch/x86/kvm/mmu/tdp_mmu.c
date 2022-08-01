@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include "asm/kvm_host.h"
+#include "linux/list.h"
+#include "linux/stddef.h"
 #include "mmu.h"
 #include "mmu_internal.h"
 #include "mmutrace.h"
@@ -30,6 +33,7 @@ bool kvm_mmu_init_tdp_mmu(struct kvm *kvm)
 	INIT_LIST_HEAD(&kvm->arch.tdp_mmu_roots);
 	spin_lock_init(&kvm->arch.tdp_mmu_pages_lock);
 	INIT_LIST_HEAD(&kvm->arch.tdp_mmu_pages);
+	INIT_LIST_HEAD(&kvm->arch.tdp_private_mmu_pages);
 
 	return true;
 }
@@ -49,6 +53,7 @@ void kvm_mmu_uninit_tdp_mmu(struct kvm *kvm)
 		return;
 
 	WARN_ON(!list_empty(&kvm->arch.tdp_mmu_pages));
+	WARN_ON(!list_empty(&kvm->arch.tdp_private_mmu_pages));
 	WARN_ON(!list_empty(&kvm->arch.tdp_mmu_roots));
 
 	/*
@@ -212,8 +217,8 @@ static struct kvm_mmu_page *alloc_tdp_mmu_page(struct kvm_vcpu *vcpu, gfn_t gfn,
 	return sp;
 }
 
-static struct kvm_mmu_page *kvm_tdp_mmu_get_vcpu_root(struct kvm_vcpu *vcpu,
-						      bool private)
+static struct kvm_mmu_page *
+kvm_tdp_mmu_get_vcpu_root_no_alloc(struct kvm_vcpu *vcpu, bool private)
 {
 	union kvm_mmu_page_role role;
 	struct kvm *kvm = vcpu->kvm;
@@ -224,12 +229,27 @@ static struct kvm_mmu_page *kvm_tdp_mmu_get_vcpu_root(struct kvm_vcpu *vcpu,
 	role = page_role_for_level(vcpu, vcpu->arch.mmu->shadow_root_level,
 			private);
 
-	/* Check for an existing root before allocating a new one. */
 	for_each_tdp_mmu_root(kvm, root, kvm_mmu_role_as_id(role)) {
 		if (root->role.word == role.word &&
 		    kvm_tdp_mmu_get_root(kvm, root))
-			goto out;
+			return root;
 	}
+
+	return NULL;
+}
+
+static struct kvm_mmu_page *kvm_tdp_mmu_get_vcpu_root(struct kvm_vcpu *vcpu,
+						      bool private)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm_mmu_page *root;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	/* Check for an existing root before allocating a new one. */
+	root = kvm_tdp_mmu_get_vcpu_root_no_alloc(vcpu, private);
+	if (!!root)
+		goto out;
 
 	root = alloc_tdp_mmu_page(vcpu, 0, vcpu->arch.mmu->shadow_root_level,
 			private);
@@ -241,6 +261,58 @@ static struct kvm_mmu_page *kvm_tdp_mmu_get_vcpu_root(struct kvm_vcpu *vcpu,
 
 out:
 	return root;
+}
+
+hpa_t kvm_dtp_mmu_move_private_pages_from(struct kvm_vcpu *vcpu,
+					  struct kvm_vcpu *src_vcpu)
+{
+	union kvm_mmu_page_role role;
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm *src_kvm = src_vcpu->kvm;
+	struct kvm_mmu_page *root;
+	struct kvm_mmu_page *private_root = NULL;
+
+	lockdep_assert_held_write(&vcpu->kvm->mmu_lock);
+	lockdep_assert_held_write(&src_vcpu->kvm->mmu_lock);
+
+	role = page_role_for_level(vcpu, vcpu->arch.mmu->shadow_root_level, true);
+
+	/* Find the private root. */
+	for_each_tdp_mmu_root(src_kvm, root, kvm_mmu_role_as_id(role)) {
+		if (root->role.word == role.word &&
+		    !root->role.invalid &&
+		    is_private_sp(root)) {
+			private_root = root;
+			break;
+		}
+	}
+
+	if (!private_root)
+		return INVALID_PAGE;
+
+	/*Remove the private root from the src kvm and add it to dst kvm. */
+	list_del(&private_root->link);
+	list_add(&private_root->link, &kvm->arch.tdp_mmu_roots);
+
+	/*
+	 * Move all the private tdp mmu pages from src to dst by replacing the
+	 * list heads.
+	 */
+	list_replace_init(&src_kvm->arch.tdp_private_mmu_pages,
+			  &kvm->arch.tdp_private_mmu_pages);
+
+	return __pa(private_root->spt);
+}
+
+hpa_t kvm_tdp_mmu_get_vcpu_root_hpa_no_alloc(struct kvm_vcpu *vcpu, bool private)
+{
+	struct kvm_mmu_page *root;
+
+	root = kvm_tdp_mmu_get_vcpu_root_no_alloc(vcpu, private);
+	if (!root)
+		return INVALID_PAGE;
+
+	return __pa(root->spt);
 }
 
 hpa_t kvm_tdp_mmu_get_vcpu_root_hpa(struct kvm_vcpu *vcpu, bool private)
@@ -304,7 +376,10 @@ static void tdp_mmu_link_page(struct kvm *kvm, struct kvm_mmu_page *sp,
 			      bool account_nx)
 {
 	spin_lock(&kvm->arch.tdp_mmu_pages_lock);
-	list_add(&sp->link, &kvm->arch.tdp_mmu_pages);
+	if (is_private_sp(sp))
+		list_add(&sp->link, &kvm->arch.tdp_private_mmu_pages);
+	else
+		list_add(&sp->link, &kvm->arch.tdp_mmu_pages);
 	if (account_nx)
 		account_huge_nx_page(kvm, sp);
 	spin_unlock(&kvm->arch.tdp_mmu_pages_lock);

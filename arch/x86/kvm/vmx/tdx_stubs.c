@@ -47,3 +47,5 @@ int tdx_vcpu_ioctl(struct kvm_vcpu *vcpu, void __user *argp) { return -EOPNOTSUP
 
 void tdx_flush_tlb(struct kvm_vcpu *vcpu) {}
 void tdx_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa, int root_level) {}
+
+int tdx_vm_copy_enc_context_from(struct kvm *kvm, unsigned int source_fd) { return -EOPNOTSUPP; }

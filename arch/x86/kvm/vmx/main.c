@@ -860,6 +860,14 @@ static int vt_mem_enc_op_vcpu(struct kvm_vcpu *vcpu, void __user *argp)
 	return tdx_vcpu_ioctl(vcpu, argp);
 }
 
+static int vm_copy_enc_context_from(struct kvm *kvm, unsigned int source_fd)
+{
+	if (!is_td(kvm))
+		return -ENOTTY;
+
+	return tdx_vm_copy_enc_context_from(kvm, source_fd);
+}
+
 struct kvm_x86_ops vt_x86_ops __initdata = {
 	.name = "kvm_intel",
 
@@ -1005,6 +1013,8 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
 	.mem_enc_op_dev = vt_mem_enc_op_dev,
 	.mem_enc_op = vt_mem_enc_op,
 	.mem_enc_op_vcpu = vt_mem_enc_op_vcpu,
+
+	.vm_copy_enc_context_from = vm_copy_enc_context_from,
 };
 
 static struct kvm_x86_init_ops vt_init_ops __initdata = {

@@ -15,6 +15,8 @@
  *   Avi Kivity   <avi@qumranet.com>
  */
 
+#include "asm-generic/errno-base.h"
+#include "asm/kvm_host.h"
 #include "irq.h"
 #include "ioapic.h"
 #include "mmu.h"
@@ -25,6 +27,7 @@
 #include "kvm_emulate.h"
 #include "cpuid.h"
 #include "spte.h"
+#include "asm-generic/bug.h"
 
 #include <linux/kvm_host.h>
 #include <linux/types.h>
@@ -3564,6 +3567,65 @@ out_unlock:
 	mutex_unlock(&kvm->slots_arch_lock);
 	return r;
 }
+
+int kvm_mmu_move_private_pages_from(struct kvm_vcpu *vcpu,
+				    struct kvm_vcpu *src_vcpu)
+{
+	struct kvm_mmu *mmu = vcpu->arch.mmu;
+	struct kvm_mmu *src_mmu = src_vcpu->arch.mmu;
+	gfn_t gfn_stolen = kvm_gfn_stolen_mask(vcpu->kvm);
+	hpa_t private_root_hpa, shared_root_hpa;
+	int r = -EINVAL;
+
+	// Hold locks for both src and dst. Always take the src lock first.
+	write_lock(&src_vcpu->kvm->mmu_lock);
+	write_lock(&vcpu->kvm->mmu_lock);
+
+	if (!gfn_stolen)
+		goto out_unlock;
+
+	WARN_ON_ONCE(!is_tdp_mmu_enabled(vcpu->kvm));
+	WARN_ON_ONCE(!is_tdp_mmu_enabled(src_vcpu->kvm));
+
+	r = mmu_topup_memory_caches(vcpu, !vcpu->arch.mmu->direct_map);
+	if (r)
+		goto out_unlock;
+
+	/*
+	 * The private root is moved from the src to the dst and is marked as
+	 * invalid in the src.
+	 */
+	private_root_hpa = kvm_dtp_mmu_move_private_pages_from(vcpu, src_vcpu);
+	if (private_root_hpa == INVALID_PAGE) {
+		/*
+		 * This likely means that the private root was already moved by
+		 * another vCPU.
+		 */
+		private_root_hpa = kvm_tdp_mmu_get_vcpu_root_hpa_no_alloc(vcpu, true);
+		if (private_root_hpa == INVALID_PAGE) {
+			r = -EINVAL;
+			goto out_unlock;
+		}
+	}
+
+	mmu->private_root_hpa = private_root_hpa;
+	src_mmu->private_root_hpa = INVALID_PAGE;
+
+	/*
+	 * The shared root is allocated normally and is not moved from the src.
+	 */
+	shared_root_hpa = kvm_tdp_mmu_get_vcpu_root_hpa(vcpu, false);
+	mmu->root_hpa = shared_root_hpa;
+
+	static_call(kvm_x86_tlb_flush_current)(vcpu);
+
+out_unlock:
+	write_unlock(&vcpu->kvm->mmu_lock);
+	write_unlock(&src_vcpu->kvm->mmu_lock);
+
+	return r;
+}
+EXPORT_SYMBOL(kvm_mmu_move_private_pages_from);
 
 static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
 {

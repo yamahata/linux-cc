@@ -1214,6 +1214,11 @@ struct kvm_arch {
 	struct list_head tdp_mmu_pages;
 
 	/*
+	 * Same as tdp_mmu_pages but only for private pages.
+	 */
+	struct list_head tdp_private_mmu_pages;
+
+	/*
 	 * Protects accesses to the following fields when the MMU lock
 	 * is held in read mode:
 	 *  - tdp_mmu_roots (above)

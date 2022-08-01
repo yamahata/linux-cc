@@ -349,3 +349,31 @@ void prepare_source_image(struct kvm_vm *vm, void *guest_code,
 		      (TDX_GUEST_MAX_NR_PAGES * PAGE_SIZE));
 	free(source_mem);
 }
+
+uint64_t add_shared_mem_region(struct kvm_vm *vm, uint64_t shared_gpa, uint64_t num_pages)
+{
+	struct userspace_mem_region *region;
+	// static int num_regions_added = 0;
+	uint64_t shared_hva = 0;
+	int ctr;
+
+	TEST_ASSERT(shared_gpa > TDX_GUEST_MAX_NR_PAGES * PAGE_SIZE,
+		    "Shared GPA is within the guest private memory region");
+
+	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+				    shared_gpa, 1,
+				    num_pages, 0);
+	// num_regions_added++;
+
+	hash_for_each(vm->regions.slot_hash, ctr, region, slot_node) {
+		uint64_t region_guest_addr;
+
+		region_guest_addr = (uint64_t)region->region.guest_phys_addr;
+		if (region_guest_addr == (shared_gpa)) {
+			shared_hva = (uint64_t)region->host_mem;
+			break;
+		}
+	}
+
+	return shared_hva;
+}

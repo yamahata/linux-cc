@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
+#include "asm-generic/errno-base.h"
+#include "linux/printk.h"
 #include <linux/cpu.h>
 #include <linux/mmu_context.h>
 #include <linux/kvm_host.h>
@@ -2331,4 +2333,284 @@ void __init tdx_pre_kvm_init(unsigned int *vcpu_size,
 
 	if (sizeof(struct kvm_tdx) > *vm_size)
 		*vm_size = sizeof(struct kvm_tdx);
+}
+
+static __always_inline bool tdx_guest(struct kvm *kvm)
+{
+	struct kvm_tdx *tdx_kvm = to_kvm_tdx(kvm);
+
+	return tdx_kvm->finalized;
+}
+
+static int tdx_lock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
+{
+	struct kvm_tdx *dst_tdx = to_kvm_tdx(dst_kvm);
+	struct kvm_tdx *src_tdx = to_kvm_tdx(src_kvm);
+
+	int r = -EBUSY;
+
+	if (dst_kvm == src_kvm)
+		return -EINVAL;
+
+	/*
+	 * Bail if these VMs are already involved in a migration to avoid
+	 * deadlock between two VMs trying to migrate to/from each other.
+	 */
+	if (atomic_cmpxchg_acquire(&dst_tdx->migration_in_progress, 0, 1))
+		return -EBUSY;
+
+	if (atomic_cmpxchg_acquire(&src_tdx->migration_in_progress, 0, 1))
+		goto release_dst;
+
+	r = -EINTR;
+	if (mutex_lock_killable(&dst_kvm->lock))
+		goto release_src;
+	if (mutex_lock_killable_nested(&src_kvm->lock, SINGLE_DEPTH_NESTING))
+		goto unlock_dst;
+	return 0;
+
+unlock_dst:
+	mutex_unlock(&dst_kvm->lock);
+release_src:
+	atomic_set_release(&src_tdx->migration_in_progress, 0);
+release_dst:
+	atomic_set_release(&dst_tdx->migration_in_progress, 0);
+	return r;
+}
+
+static void tdx_unlock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
+{
+	struct kvm_tdx *dst_tdx = to_kvm_tdx(dst_kvm);
+	struct kvm_tdx *src_tdx = to_kvm_tdx(src_kvm);
+
+	mutex_unlock(&dst_kvm->lock);
+	mutex_unlock(&src_kvm->lock);
+	atomic_set_release(&dst_tdx->migration_in_progress, 0);
+	atomic_set_release(&src_tdx->migration_in_progress, 0);
+}
+
+static int tdx_lock_vcpus_for_migration(struct kvm *kvm)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long i, j;
+
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		if (mutex_lock_killable(&vcpu->mutex))
+			goto out_unlock;
+	}
+
+	return 0;
+
+out_unlock:
+	kvm_for_each_vcpu(j, vcpu, kvm) {
+		if (i == j)
+			break;
+
+		mutex_unlock(&vcpu->mutex);
+	}
+	return -EINTR;
+}
+
+static void tdx_unlock_vcpus_for_migration(struct kvm *kvm)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		mutex_unlock(&vcpu->mutex);
+	}
+}
+
+static int tdx_migrate_from(struct kvm *dst, struct kvm *src)
+{
+	struct tdx_td_page empty_td_page = { 0, 0, false };
+	struct vcpu_tdx *dst_tdx_vcpu, *src_tdx_vcpu;
+	struct kvm_memory_slot *src_slot, *dst_slot;
+	struct kvm_memslots *src_slots, *dst_slots;
+	struct kvm_vcpu *dst_vcpu, *src_vcpu;
+	struct kvm_tdx *src_tdx, *dst_tdx;
+	int ret, i, j;
+
+	src_tdx = to_kvm_tdx(src);
+	dst_tdx = to_kvm_tdx(dst);
+
+	/* Check memslots consistency */
+	/* TODO: Do we also need to check consistency for as_id == SMM? */
+	src_slots = __kvm_memslots(src, 0);
+	dst_slots = __kvm_memslots(dst, 0);
+
+	ret = -EINVAL;
+
+	if (src_slots->used_slots != dst_slots->used_slots)
+		goto abort;
+
+	for (i = 0; i < src_slots->used_slots; i++) {
+		src_slot = &src_slots->memslots[i];
+		dst_slot = &dst_slots->memslots[i];
+
+		if (src_slot->base_gfn != dst_slot->base_gfn)
+			goto abort;
+
+		if (src_slot->npages != dst_slot->npages)
+			goto abort;
+
+		if (src_slot->flags != dst_slot->flags)
+			goto abort;
+	}
+
+	/* TODO: Add checks to make sure attributes, cpuid_entries etc. match
+	 * between src and dst VMs.
+	 */
+
+
+	/* Teardown the destination VM.
+	 * This call will reclaim hkid.
+	 */
+	tdx_vm_teardown(dst);
+
+	/* Free each of the destination vCPUs.
+	 * This will reclaim all the tdvpr and tdvpx pages.
+	 */
+	kvm_for_each_vcpu(i, dst_vcpu, dst)
+		tdx_vcpu_free(dst_vcpu);
+
+	/* Free the destination VM.
+	 * This will reclaim the tdr and tdcs pages.
+	 */
+	tdx_vm_free(dst);
+
+	/* Copy all the state from src_tdx to dst_tdx */
+	dst_tdx->hkid = src_tdx->hkid;
+	dst_tdx->tdr = src_tdx->tdr;
+
+	dst_tdx->tdcs = kcalloc(tdx_caps.tdcs_nr_pages, sizeof(*dst_tdx->tdcs),
+				GFP_KERNEL_ACCOUNT);
+	if (!dst_tdx->tdcs) {
+		ret = -ENOMEM;
+		goto abort;
+	}
+	memcpy(dst_tdx->tdcs, src_tdx->tdcs,
+	       tdx_caps.tdcs_nr_pages * sizeof(*dst_tdx->tdcs));
+
+	/* All other state such as attributes and cpuid_entries were already
+	 * used in tdx_td_init, tdx_vcpu_reset etc.
+	 * Changing the values here won't have any effect.
+	 */
+
+	/* Flush the vCPUs of the src. This will disassociate the TDX vCPUs from
+	 * the LPs and must be called from the LP currently associated with the
+	 * vCPU.
+	 */
+	kvm_for_each_vcpu(i, src_vcpu, src)
+		tdx_flush_vp_on_cpu(src_vcpu);
+
+	/* Copy per-vCPU state */
+	kvm_for_each_vcpu(i, src_vcpu, src) {
+		src_tdx_vcpu = to_tdx(src_vcpu);
+		dst_vcpu = kvm_get_vcpu(dst, i);
+		dst_tdx_vcpu = to_tdx(dst_vcpu);
+
+		dst_tdx_vcpu->tdvpr = src_tdx_vcpu->tdvpr;
+
+		dst_tdx_vcpu->tdvpx = kcalloc(tdx_caps.tdvpx_nr_pages,
+					      sizeof(*dst_tdx_vcpu->tdvpx),
+					      GFP_KERNEL_ACCOUNT);
+		if (!dst_tdx->tdcs) {
+			ret = -ENOMEM;
+			goto abort;
+		}
+		memcpy(dst_tdx_vcpu->tdvpx, src_tdx_vcpu->tdvpx,
+		       tdx_caps.tdvpx_nr_pages * sizeof(*dst_tdx_vcpu->tdvpx));
+
+		for (j = 0; j < tdx_caps.tdvpx_nr_pages; j++)
+			src_tdx_vcpu->tdvpx[j] = empty_td_page;
+
+		src_tdx_vcpu->tdvpr = empty_td_page;
+	}
+
+	/* Copy EPT tables for each vCPU */
+	kvm_for_each_vcpu(i, src_vcpu, src) {
+		dst_vcpu = kvm_get_vcpu(dst, i);
+
+		if (kvm_mmu_move_private_pages_from(dst_vcpu, src_vcpu)) {
+			ret = -EINVAL;
+			goto abort;
+		}
+	}
+
+	WARN_ON(!src_tdx->finalized);
+	dst_tdx->finalized = true;
+
+	/* Clear source VM to avoid freeing the hkid and pages on VM put */
+	src_tdx->hkid = 0;
+	src_tdx->tdr = empty_td_page;
+	for (i = 0; i < tdx_caps.tdcs_nr_pages; i++)
+		src_tdx->tdcs[i] = empty_td_page;
+
+	return 0;
+
+abort:
+	/* TODO: Add more cleanup in case we failed half way through. */
+	dst_tdx->hkid = 0;
+	dst_tdx->tdr = empty_td_page;
+
+	return ret;
+}
+
+int tdx_vm_copy_enc_context_from(struct kvm *kvm, unsigned int source_fd)
+{
+	struct file *source_kvm_file;
+	struct kvm_vcpu *src_vcpu;
+	struct kvm *source_kvm;
+	int ret, i;
+
+	source_kvm_file = fget(source_fd);
+	if (!file_is_kvm(source_kvm_file)) {
+		ret = -EBADF;
+		goto out_fput;
+	}
+
+	source_kvm = source_kvm_file->private_data;
+	ret = tdx_lock_two_vms(kvm, source_kvm);
+	if (ret)
+		goto out_fput;
+
+	if (tdx_guest(kvm) || !tdx_guest(source_kvm)) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (atomic_read(&kvm->online_vcpus) !=
+	    atomic_read(&source_kvm->online_vcpus))
+		return -EINVAL;
+
+	kvm_for_each_vcpu(i, src_vcpu, source_kvm) {
+		if (!src_vcpu->arch.guest_state_protected)
+			return -EINVAL;
+	}
+
+	ret = tdx_lock_vcpus_for_migration(kvm);
+	if (ret)
+		goto out_unlock;
+	ret = tdx_lock_vcpus_for_migration(source_kvm);
+	if (ret)
+		goto out_dst_vcpu;
+
+	ret = tdx_migrate_from(kvm, source_kvm);
+	if (ret)
+		goto out_source_vcpu;
+
+	kvm_vm_bugged(source_kvm);
+	ret = 0;
+
+out_source_vcpu:
+	tdx_unlock_vcpus_for_migration(source_kvm);
+out_dst_vcpu:
+	tdx_unlock_vcpus_for_migration(kvm);
+out_unlock:
+	tdx_unlock_two_vms(kvm, source_kvm);
+out_fput:
+	if (source_kvm_file)
+		fput(source_kvm_file);
+	return ret;
 }
